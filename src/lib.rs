@@ -1,3 +1,4 @@
+#![feature(type_ascription)]
 #[macro_use]
 extern crate lazy_static;
 extern crate curl;
@@ -67,28 +68,43 @@ impl Handler for Writeback {
 }
 
 lazy_static! {
-    static ref CLIENT: Mutex<Easy2<Writeback>> = {
-        let x = Mutex::new(Easy2::new(Writeback(Vec::new())));
-        let mut held = x.lock().unwrap();
-        held.get(true).unwrap();
-        held.dns_cache_timeout(Duration::from_secs(60*60*3)).unwrap();
-        held.accept_encoding("").unwrap();
-        held.follow_location(true).unwrap();
-        held.useragent("Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko").unwrap(); // Aw yea
-        // held.cookie_file("./cookies.txt").unwrap();
-        // held.cookie_jar("./cookies.txt").unwrap();
-        held.timeout(Duration::from_secs(20)).unwrap();
-        held.connect_timeout(Duration::from_secs(20)).unwrap();
-        held.http_version(curl::easy::HttpVersion::V2TLS).unwrap();
-        held.ssl_version(curl::easy::SslVersion::Tlsv13).unwrap();
-        unsafe { assert_eq!(curl_sys::curl_easy_setopt(held.raw(), curl_sys::CURLUSESSL_ALL), curl_sys::CURLE_OK);};
-        drop(held);
-        x
+    static ref CLIENT: Result<Mutex<Easy2<Writeback>>, String> = {
+        let lock = Mutex::new(Easy2::new(Writeback(Vec::new())));
+        if let Err(x) = (|| -> Result<(), Box<dyn Error + Send + Sync>> {
+            let mut held = lock.lock().map_err(|x| x.to_string())?;
+            held.get(true)?;
+            held.dns_cache_timeout(Duration::from_secs(60 * 60 * 3))?;
+            held.accept_encoding("")?;
+            held.follow_location(true)?;
+            held.useragent(
+                "Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+            )?;
+            held.timeout(Duration::from_secs(20))?;
+            held.connect_timeout(Duration::from_secs(20))?;
+            held.http_version(curl::easy::HttpVersion::V2TLS)?;
+            held.ssl_version(curl::easy::SslVersion::Tlsv13)?;
+            unsafe {
+                match curl_sys::curl_easy_setopt(held.raw(), curl_sys::CURLUSESSL_ALL) {
+                    curl_sys::CURLE_OK => Ok(()),
+                    x => Err(curl::Error::new(x)),
+                }
+            }?;
+            drop(held);
+            Ok(())
+        })() {
+            return Err(x.to_string());
+        };
+        Ok(lock)
     };
 }
 
-pub fn google(query: &str) -> Result<Vec<GResult>, Box<dyn Error>> {
-    let mut held = CLIENT.lock().unwrap();
+pub fn google(query: &str) -> Result<Vec<GResult>, Box<dyn Error + Send + Sync>> {
+    let mut held = match &*CLIENT {
+        Ok(x) => x,
+        Err(x) => return Err(Box::from(x.as_str())),
+    }
+    .lock()
+    .unwrap();
     held.url(
         &[
             GOOGLE_URL,
@@ -97,9 +113,8 @@ pub fn google(query: &str) -> Result<Vec<GResult>, Box<dyn Error>> {
                 .collect::<Cow<str>>(),
         ]
         .concat(),
-    )
-    .unwrap();
-    held.perform().unwrap();
+    )?;
+    held.perform()?;
     let result = Html::parse_document(&String::from_utf8_lossy(&held.get_ref().0))
         .select(&LINK_SELECT)
         .take(3)
