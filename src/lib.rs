@@ -1,19 +1,20 @@
-#![feature(type_ascription)]
-#[macro_use]
-extern crate lazy_static;
-extern crate curl;
-extern crate curl_sys;
-extern crate percent_encoding;
-extern crate scraper;
-
 use curl::easy::{Easy2, Handler, WriteError};
+use lazy_static::lazy_static;
 use scraper::ElementRef;
 use scraper::{Html, Selector};
 use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::error::Error;
+#[cfg(feature = "ffi")]
+use std::ffi::CString;
+use std::mem;
 use std::sync::Mutex;
 use std::time::Duration;
+
+#[cfg(feature = "ffi")]
+mod ffi;
+#[cfg(feature = "ffi")]
+use ffi::*;
 
 const GOOGLE_URL: &str = "https://www.google.com/search?source=hp";
 
@@ -25,7 +26,8 @@ lazy_static! {
     static ref DESCRIPTION_SELECT: Selector = Selector::parse("div.s").unwrap();
 }
 
-#[derive(Debug, Default)]
+#[cfg(not(feature = "ffi"))]
+#[derive(Debug)]
 pub struct GResult {
     title: String,
     link: String,
@@ -33,28 +35,40 @@ pub struct GResult {
 }
 
 impl TryFrom<ElementRef<'_>> for GResult {
-    type Error = &'static str;
+    type Error = Box<dyn Error + Send + Sync>;
     fn try_from(value: ElementRef) -> Result<Self, Self::Error> {
         let srch_result = value
             .ancestors()
             .nth(4)
             .and_then(ElementRef::wrap)
             .ok_or("Couldnt get search node")?;
-        Ok(GResult {
-            title: srch_result
-                .select(&TITLE_SELECT)
-                .next()
-                .ok_or("Cant get title")?
-                .text()
-                .collect::<String>(),
-            link: value.text().collect::<String>(),
-            description: srch_result
-                .select(&DESCRIPTION_SELECT)
-                .next()
-                .ok_or("Cant get description")?
-                .text()
-                .collect::<String>(),
-        })
+        let title = srch_result
+            .select(&TITLE_SELECT)
+            .next()
+            .ok_or("Cant get title")?
+            .text()
+            .collect::<String>();
+        let link = value.text().collect::<String>();
+        let description = srch_result
+            .select(&DESCRIPTION_SELECT)
+            .next()
+            .ok_or("Cant get description")?
+            .text()
+            .collect::<String>();
+        Ok(
+            #[cfg(not(feature = "ffi"))]
+            GResult {
+                title,
+                link,
+                description,
+            },
+            #[cfg(feature = "ffi")]
+            GResult {
+                title: CString::new(title)?.into_raw(),
+                link: CString::new(link)?.into_raw(),
+                description: CString::new(description)?.into_raw(),
+            },
+        )
     }
 }
 
@@ -81,15 +95,16 @@ lazy_static! {
             )?;
             held.timeout(Duration::from_secs(20))?;
             held.connect_timeout(Duration::from_secs(20))?;
-            held.http_version(curl::easy::HttpVersion::V2TLS)?;
-            held.ssl_version(curl::easy::SslVersion::Tlsv13)?;
-            unsafe {
-                match curl_sys::curl_easy_setopt(held.raw(), curl_sys::CURLUSESSL_ALL) {
-                    curl_sys::CURLE_OK => Ok(()),
-                    x => Err(curl::Error::new(x)),
-                }
-            }?;
-            drop(held);
+            // held.http_version(curl::easy::HttpVersion::V2TLS)?;
+            // held.ssl_version(curl::easy::SslVersion::Tlsv13)?;
+            // unsafe {
+            //     match curl_sys::curl_easy_setopt(held.raw(), curl_sys::CURLUSESSL_ALL) {
+            //         curl_sys::CURLE_OK => Ok(()),
+            //         x => Err(curl::Error::new(x)),
+            //     }
+            // }?;
+            // For some reason this doesnt work and I get unsupported protocol sometimes
+            mem::drop(held); // Locks are scary, so are macros, lets be careful :)
             Ok(())
         })() {
             return Err(x.to_string());
@@ -98,7 +113,13 @@ lazy_static! {
     };
 }
 
+#[cfg(not(feature = "ffi"))]
 pub fn google(query: &str) -> Result<Vec<GResult>, Box<dyn Error + Send + Sync>> {
+    _google(query)
+}
+
+#[inline(always)]
+fn _google(query: &str) -> Result<Vec<GResult>, Box<dyn Error + Send + Sync>> {
     let mut held = match &*CLIENT {
         Ok(x) => x,
         Err(x) => return Err(Box::from(x.as_str())),
@@ -119,7 +140,9 @@ pub fn google(query: &str) -> Result<Vec<GResult>, Box<dyn Error + Send + Sync>>
         .select(&LINK_SELECT)
         .take(3)
         .map(GResult::try_from)
-        .collect::<Result<Vec<GResult>, &'static str>>()?;
+        .collect::<Result<Vec<GResult>, Box<dyn Error + Send + Sync>>>()?;
+    assert_eq!(result.len(), 3);
+    assert_eq!(result.capacity(), 4);
     held.get_mut().0 = Vec::new(); // clearning dat state, also this sucks
     Ok(result)
 }
